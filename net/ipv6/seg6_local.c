@@ -136,6 +136,8 @@ struct seg6_local_lwt {
 #ifdef CONFIG_NET_L3_MASTER_DEV
 	struct seg6_end_dt_info dt_info;
 #endif
+	uint8_t next_header;
+	struct in6_addr ingress_address;
 	struct pcpu_seg6_local_counters __percpu *pcpu_counters;
 
 	int headroom;
@@ -948,6 +950,52 @@ drop:
 	return -EINVAL;
 }
 
+static int input_action_end_nm_i(struct sk_buff *skb,
+				struct seg6_local_lwt *slwt)
+{
+	struct ipv6hdr *ip6h;
+
+	if (ntohs(skb->protocol) != ETH_P_IPV6) {
+		net_warn_ratelimited("%s: unsupported protocol 0x%04x\n",
+				     __func__, ntohs(skb->protocol));
+		goto drop;
+	}
+
+	ip6h = ipv6_hdr(skb);
+	if (ip6h->nexthdr != slwt->next_header) {
+		net_warn_ratelimited("%s: invalid nexthdr %d\n",
+				     __func__, ntohs(ip6h->nexthdr));
+		goto drop;
+	}
+
+	ip6h->nexthdr = 43;
+	return input_action_end(skb, slwt);
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
+static int input_action_end_nm_e(struct sk_buff *skb,
+				struct seg6_local_lwt *slwt)
+{
+	struct ipv6hdr *ip6h;
+	struct ipv6_sr_hdr *srh;
+
+	srh = get_and_validate_srh(skb);
+	if (!srh)
+		goto drop;
+
+	ip6h = ipv6_hdr(skb);
+	ip6h->nexthdr = slwt->next_header;
+	ip6h->daddr = slwt->ingress_address;
+
+	seg6_lookup_nexthop(skb, NULL, 0);
+	return dst_input(skb);
+drop:
+	kfree_skb(skb);
+	return -EINVAL;
+}
+
 static struct seg6_action_desc seg6_action_table[] = {
 	{
 		.action		= SEG6_LOCAL_ACTION_END,
@@ -1042,6 +1090,19 @@ static struct seg6_action_desc seg6_action_table[] = {
 		.optattrs	= SEG6_F_LOCAL_COUNTERS,
 		.input		= input_action_end_bpf,
 	},
+	{
+		.action		= SEG6_LOCAL_ACTION_END_NM_I,
+		.attrs		= SEG6_F_ATTR(SEG6_LOCAL_NEXT_HEADER),
+		.optattrs	= SEG6_F_LOCAL_COUNTERS,
+		.input		= input_action_end_nm_i,
+	},
+	{
+		.action		= SEG6_LOCAL_ACTION_END_NM_E,
+		.attrs		= SEG6_F_ATTR(SEG6_LOCAL_NEXT_HEADER) |
+					SEG6_F_ATTR(SEG6_LOCAL_INGRESS_ADDRESS),
+		.optattrs	= SEG6_F_LOCAL_COUNTERS,
+		.input		= input_action_end_nm_e,
+	},
 
 };
 
@@ -1132,6 +1193,9 @@ static const struct nla_policy seg6_local_policy[SEG6_LOCAL_MAX + 1] = {
 	[SEG6_LOCAL_IIF]	= { .type = NLA_U32 },
 	[SEG6_LOCAL_OIF]	= { .type = NLA_U32 },
 	[SEG6_LOCAL_BPF]	= { .type = NLA_NESTED },
+	[SEG6_LOCAL_NEXT_HEADER]		= { .type = NLA_U8 },
+	[SEG6_LOCAL_INGRESS_ADDRESS]	= { .type = NLA_BINARY,
+					.len = sizeof(struct in6_addr) },
 	[SEG6_LOCAL_COUNTERS]	= { .type = NLA_NESTED },
 };
 
@@ -1437,6 +1501,58 @@ static void destroy_attr_bpf(struct seg6_local_lwt *slwt)
 		bpf_prog_put(slwt->bpf.prog);
 }
 
+static int parse_nla_next_header(struct nlattr **attrs, struct seg6_local_lwt *slwt)
+{
+	memcpy(&slwt->next_header, nla_data(attrs[SEG6_LOCAL_NEXT_HEADER]),
+	       sizeof(uint8_t));
+
+	return 0;
+}
+
+static int put_nla_next_header(struct sk_buff *skb, struct seg6_local_lwt *slwt)
+{
+	struct nlattr *nla;
+
+	nla = nla_reserve(skb, SEG6_LOCAL_NEXT_HEADER, sizeof(uint8_t));
+	if (!nla)
+		return -EMSGSIZE;
+
+	memcpy(nla_data(nla), &slwt->next_header, sizeof(uint8_t));
+
+	return 0;
+}
+
+static int cmp_nla_next_header(struct seg6_local_lwt *a, struct seg6_local_lwt *b)
+{
+	return memcmp(&a->next_header, &b->next_header, sizeof(uint8_t));
+}
+
+static int parse_nla_ingress_address(struct nlattr **attrs, struct seg6_local_lwt *slwt)
+{
+	memcpy(&slwt->ingress_address, nla_data(attrs[SEG6_LOCAL_INGRESS_ADDRESS]),
+	       sizeof(struct in6_addr));
+
+	return 0;
+}
+
+static int put_nla_ingress_address(struct sk_buff *skb, struct seg6_local_lwt *slwt)
+{
+	struct nlattr *nla;
+
+	nla = nla_reserve(skb, SEG6_LOCAL_INGRESS_ADDRESS, sizeof(struct in6_addr));
+	if (!nla)
+		return -EMSGSIZE;
+
+	memcpy(nla_data(nla), &slwt->ingress_address, sizeof(struct in6_addr));
+
+	return 0;
+}
+
+static int cmp_nla_ingress_address(struct seg6_local_lwt *a, struct seg6_local_lwt *b)
+{
+	return memcmp(&a->ingress_address, &b->ingress_address, sizeof(struct in6_addr));
+}
+
 static const struct
 nla_policy seg6_local_counters_policy[SEG6_LOCAL_CNT_MAX + 1] = {
 	[SEG6_LOCAL_CNT_PACKETS]	= { .type = NLA_U64 },
@@ -1589,6 +1705,14 @@ static struct seg6_action_param seg6_action_params[SEG6_LOCAL_MAX + 1] = {
 	[SEG6_LOCAL_VRFTABLE]	= { .parse = parse_nla_vrftable,
 				    .put = put_nla_vrftable,
 				    .cmp = cmp_nla_vrftable },
+
+	[SEG6_LOCAL_NEXT_HEADER]	= { .parse = parse_nla_next_header,
+				    .put = put_nla_next_header,
+				    .cmp = cmp_nla_next_header },
+
+	[SEG6_LOCAL_INGRESS_ADDRESS]	= { .parse = parse_nla_ingress_address,
+				    .put = put_nla_ingress_address,
+				    .cmp = cmp_nla_ingress_address },
 
 	[SEG6_LOCAL_COUNTERS]	= { .parse = parse_nla_counters,
 				    .put = put_nla_counters,
@@ -1895,6 +2019,12 @@ static int seg6_local_get_encap_size(struct lwtunnel_state *lwt)
 
 	if (attrs & SEG6_F_ATTR(SEG6_LOCAL_VRFTABLE))
 		nlsize += nla_total_size(4);
+
+	if (attrs & SEG6_F_ATTR(SEG6_LOCAL_NEXT_HEADER))
+		nlsize += nla_total_size(1);
+
+	if (attrs & SEG6_F_ATTR(SEG6_LOCAL_INGRESS_ADDRESS))
+		nlsize += nla_total_size(16);
 
 	if (attrs & SEG6_F_LOCAL_COUNTERS)
 		nlsize += nla_total_size(0) + /* nest SEG6_LOCAL_COUNTERS */

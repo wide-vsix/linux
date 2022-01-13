@@ -27,6 +27,8 @@ enum {
 	SEG6_LOCAL_OIF,
 	SEG6_LOCAL_BPF,
 	SEG6_LOCAL_VRFTABLE,
+	SEG6_LOCAL_NEXT_HEADER,
+	SEG6_LOCAL_INGRESS_ADDRESS,
 	SEG6_LOCAL_COUNTERS,
 	__SEG6_LOCAL_MAX,
 };
@@ -66,6 +68,10 @@ enum {
 	SEG6_LOCAL_ACTION_END_BPF	= 15,
 	/* decap and lookup of DA in v4 or v6 table */
 	SEG6_LOCAL_ACTION_END_DT46	= 16,
+	/* ingress part for End.NM */
+	SEG6_LOCAL_ACTION_END_NM_I	= 17,
+	/* egress part for End.NM */
+	SEG6_LOCAL_ACTION_END_NM_E	= 18,
 
 	__SEG6_LOCAL_ACTION_MAX,
 };
